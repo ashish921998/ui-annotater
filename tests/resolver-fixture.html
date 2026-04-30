@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>UI Annotator Resolver Fixture</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 32px; color: #111827; }
+      button { margin: 4px; padding: 8px 12px; border-radius: 6px; }
+      #results { margin-top: 24px; padding: 16px; border: 1px solid #d1d5db; border-radius: 8px; }
+      .pass { color: #047857; }
+      .fail { color: #b91c1c; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Resolver fixture</h1>
+
+      <section id="data-attrs">
+        <button data-testid="save" data-annotator-id="save-primary">Save</button>
+        <button data-testid="save">Wrong partial match</button>
+      </section>
+
+      <section id="ambiguous">
+        <button class="dupe-action">Duplicate</button>
+        <button class="dupe-action">Duplicate</button>
+      </section>
+
+      <section id="unicode">
+        <button id="unicode-button">创建报告</button>
+      </section>
+
+      <section id="dynamic-attrs">
+        <a id="dynamic-link" href="/dashboard?token=abc123">Dashboard</a>
+      </section>
+    </main>
+
+    <div id="results" aria-live="polite">Running...</div>
+
+    <script src="../annotator.js"></script>
+    <script>
+      const results = [];
+      const annotator = new UIAnnotator({
+        storageKey: "resolver-fixture",
+        pageKey: () => `${location.pathname}?fixture=true`,
+      });
+
+      function test(name, fn) {
+        try {
+          fn();
+          results.push({ name, ok: true });
+        } catch (error) {
+          results.push({ name, ok: false, error });
+        }
+      }
+
+      function assert(condition, message) {
+        if (!condition) throw new Error(message);
+      }
+
+      test("data attributes require all captured attributes on the same element", () => {
+        const anchor = {
+          tagName: "button",
+          dataAttributes: { "data-testid": "save", "data-annotator-id": "save-primary" },
+          attributes: {},
+          cssSelector: "",
+          indexPath: [],
+          siblingContext: null,
+          textSignature: "save",
+          visual: null,
+        };
+        const result = annotator.resolveAnchor(anchor);
+        assert(result.status === "resolved", `expected resolved, got ${result.status}`);
+        assert(result.element?.dataset.annotatorId === "save-primary", "resolved the wrong element");
+      });
+
+      test("duplicate high-confidence candidates become ambiguous", () => {
+        const anchor = {
+          tagName: "button",
+          dataAttributes: {},
+          attributes: {},
+          cssSelector: ".dupe-action",
+          indexPath: [],
+          siblingContext: null,
+          textSignature: "duplicate",
+          visual: null,
+        };
+        const result = annotator.resolveAnchor(anchor);
+        assert(result.status === "ambiguous", `expected ambiguous, got ${result.status}`);
+      });
+
+      test("unsupported future strategy versions are surfaced", () => {
+        const result = annotator.resolveAnnotation({
+          strategyVersion: 999,
+          page: { key: annotator.getPageKey(), href: location.href },
+          anchor: { bounds: { x: 0, y: 0, width: 10, height: 10 } },
+        });
+        assert(result.status === "unsupported_version", `expected unsupported_version, got ${result.status}`);
+      });
+
+      test("pageKey override controls route identity", () => {
+        assert(annotator.getPageKey().endsWith("?fixture=true"), "custom page key was not used");
+      });
+
+      test("unicode text produces a usable signature", () => {
+        const button = document.getElementById("unicode-button");
+        assert(annotator.getTextSignature(button) === "创建报告", "unicode signature was stripped");
+      });
+
+      test("dynamic attributes are context-only scoring signals", () => {
+        const link = document.getElementById("dynamic-link");
+        const score = annotator.scoreAnchorMatch(link, {
+          tagName: "a",
+          attributes: { href: "/dashboard?token=abc123" },
+          dataAttributes: {},
+          textSignature: null,
+          siblingContext: null,
+          visual: null,
+        });
+        assert(score === 9, `expected tag + context-only href score of 9, got ${score}`);
+      });
+
+      const failures = results.filter((result) => !result.ok);
+      document.getElementById("results").innerHTML = results
+        .map((result) => `<div class="${result.ok ? "pass" : "fail"}">${result.ok ? "PASS" : "FAIL"}: ${result.name}${result.error ? ` - ${result.error.message}` : ""}</div>`)
+        .join("");
+      console[failures.length ? "error" : "info"]("resolver fixture results", results);
+    </script>
+  </body>
+</html>

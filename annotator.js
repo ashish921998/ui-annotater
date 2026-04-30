@@ -4,6 +4,8 @@
   const STORAGE_PREFIX = "ui-annotator:";
   const STYLE_ID = "ui-annotator-styles";
   const STRATEGY_VERSION = 2;
+  const RESOLUTION_MIN_SCORE = 80;
+  const AMBIGUITY_MARGIN = 12;
   const DATA_ATTRIBUTE_ALLOWLIST = [
     "data-annotator-id",
     "data-testid",
@@ -14,6 +16,7 @@
     "data-component",
   ];
   const INTERNAL_SELECTOR = ".ui-annotator-root, .ui-annotator-capture, .ui-annotator-highlight, .ui-annotator-marker, .ui-annotator-panel, .ui-annotator-toast";
+  const CONTEXT_ONLY_ATTRIBUTES = new Set(["value", "checked", "selected", "disabled", "readonly", "href"]);
   const STYLE_TEXT = `
     .ui-annotator-root{color-scheme:light;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}
     .ui-annotator-toggle{position:fixed;right:20px;bottom:20px;z-index:2147483000;display:inline-flex;align-items:center;gap:8px;min-height:42px;padding:0 14px;border:1px solid #1f2937;border-radius:8px;background:#111827;color:#fff;box-shadow:0 12px 34px rgba(15,23,42,.26);cursor:pointer;font:inherit;font-weight:700}
@@ -47,8 +50,11 @@
 
   class UIAnnotator {
     constructor(options = {}) {
+      const pageKey = typeof options.pageKey === "function" ? options.pageKey : () => `${location.pathname}${location.hash}`;
+
       this.options = {
-        storageKey: options.storageKey || `${STORAGE_PREFIX}${this.getPageKey()}`,
+        pageKey,
+        storageKey: options.storageKey || `${STORAGE_PREFIX}${pageKey()}`,
         markerLabel: options.markerLabel || "Annotate",
         dataAttributeAllowlist: options.dataAttributeAllowlist || DATA_ATTRIBUTE_ALLOWLIST,
       };
@@ -312,19 +318,21 @@
       this.markers.clear();
 
       this.annotations.forEach((annotation, index) => {
-        const element = this.resolveElement(annotation.anchor);
-        const rect = this.normalizeRect(element?.getBoundingClientRect() || annotation.anchor.bounds);
+        const resolution = this.resolveAnnotation(annotation);
+        annotation.resolution = resolution.status;
+        const rect = this.normalizeRect(resolution.element?.getBoundingClientRect() || annotation.anchor.bounds);
         if (!rect) return;
 
         const marker = document.createElement("button");
         marker.type = "button";
         marker.className = "ui-annotator-marker";
         marker.textContent = String(index + 1);
-        marker.title = annotation.comment;
+        marker.title = resolution.status === "resolved" ? annotation.comment : `${annotation.comment} (${resolution.status})`;
+        marker.dataset.resolution = resolution.status;
         marker.addEventListener("click", (event) => {
           event.preventDefault();
           event.stopPropagation();
-          this.openEditor({ element, annotation, anchorRect: rect });
+          this.openEditor({ element: resolution.element, annotation, anchorRect: rect });
         });
         document.body.append(marker);
         this.positionMarker(marker, rect);
@@ -376,18 +384,87 @@
     }
 
     resolveElement(anchor) {
-      const candidates = [
-        ...this.scoreElements(this.resolveAllByDataAttributes(anchor), anchor, 100),
-        ...this.scoreElements(this.resolveAllBySelector(anchor.cssSelector), anchor, 80),
-        ...this.scoreElements(this.resolveAllBySiblingContext(anchor), anchor, 60),
-        ...this.scoreElements(this.resolveAllByTextSignature(anchor), anchor, 45),
-        ...this.scoreElements([this.resolveIndexPath(anchor.indexPath)], anchor, 25),
-      ];
-      const best = candidates
-        .filter((candidate) => candidate.element instanceof Element && !candidate.element.closest(INTERNAL_SELECTOR))
-        .sort((a, b) => b.score - a.score)[0];
+      return this.resolveAnchor(anchor).element || null;
+    }
 
-      return best?.element || null;
+    resolveAnnotation(annotation) {
+      if (annotation.strategyVersion > STRATEGY_VERSION) {
+        return { status: "unsupported_version", element: null, score: 0, candidates: [] };
+      }
+      if (annotation.page?.key && annotation.page.key !== this.getPageKey()) {
+        return { status: "lost", element: null, score: 0, candidates: [] };
+      }
+      return this.resolveAnchor(annotation.anchor);
+    }
+
+    resolveAnchor(anchor) {
+      const candidates = this.dedupeCandidates([
+        ...this.scoreElements(this.resolveAllByDataAttributes(anchor), anchor, 100, "dataAttributes"),
+        ...this.scoreElements(this.resolveAllBySelector(anchor.cssSelector), anchor, 80, "cssSelector"),
+        ...this.scoreElements(this.resolveAllBySiblingContext(anchor), anchor, 60, "siblingContext"),
+        ...this.scoreElements(this.resolveAllByTextSignature(anchor), anchor, 45, "textSignature"),
+        ...this.scoreElements([this.resolveIndexPath(anchor.indexPath)], anchor, 25, "indexPath"),
+      ]).filter((candidate) => candidate.element instanceof Element && !candidate.element.closest(INTERNAL_SELECTOR));
+
+      const [best, runnerUp] = candidates.sort((a, b) => b.score - a.score);
+      if (!best || best.score < RESOLUTION_MIN_SCORE) {
+        return { status: "lost", element: null, score: best?.score || 0, candidates };
+      }
+      if (runnerUp && best.score - runnerUp.score <= AMBIGUITY_MARGIN) {
+        return { status: "ambiguous", element: null, score: best.score, candidates };
+      }
+      return { status: "resolved", element: best.element, score: best.score, candidates };
+    }
+
+    dedupeCandidates(candidates) {
+      const byElement = new Map();
+      for (const candidate of candidates) {
+        if (!candidate.element) continue;
+        const existing = byElement.get(candidate.element);
+        if (!existing || candidate.score > existing.score) {
+          byElement.set(candidate.element, {
+            ...candidate,
+            sources: existing ? [...new Set([...existing.sources, candidate.source])] : [candidate.source],
+          });
+        } else if (existing) {
+          existing.sources = [...new Set([...existing.sources, candidate.source])];
+        }
+      }
+      return Array.from(byElement.values());
+    }
+
+    scoreElements(elements, anchor, baseScore, source) {
+      return [...new Set(elements.filter(Boolean))].map((element) => ({
+        element,
+        source,
+        score: baseScore + this.scoreAnchorMatch(element, anchor),
+      }));
+    }
+
+    getScoredAttributes(anchor) {
+      return Object.entries(anchor.attributes || {}).filter(([name]) => !CONTEXT_ONLY_ATTRIBUTES.has(name));
+    }
+
+    getContextOnlyAttributes(anchor) {
+      return Object.entries(anchor.attributes || {}).filter(([name]) => CONTEXT_ONLY_ATTRIBUTES.has(name));
+    }
+
+    scoreAnchorMatch(element, anchor) {
+      let score = 0;
+      if (anchor.tagName && element.tagName.toLowerCase() === anchor.tagName) score += 8;
+      if (anchor.id && element.id === anchor.id) score += 12;
+      if (anchor.textSignature && this.getTextSignature(element) === anchor.textSignature) score += 10;
+      if (anchor.ariaLabel && element.getAttribute("aria-label") === anchor.ariaLabel) score += 8;
+      if (anchor.role && element.getAttribute("role") === anchor.role) score += 6;
+      for (const [name, value] of this.getScoredAttributes(anchor)) {
+        if (value && element.getAttribute(name) === value) score += 4;
+      }
+      for (const [name, value] of this.getContextOnlyAttributes(anchor)) {
+        if (value && element.getAttribute(name) === value) score += 1;
+      }
+      score += this.scoreSiblingContext(element, anchor.siblingContext);
+      score += this.scoreVisualFingerprint(element, anchor.visual);
+      return score;
     }
 
     resolveAllByDataAttributes(anchor) {
@@ -418,29 +495,6 @@
     resolveAllByTextSignature(anchor) {
       if (!anchor.textSignature || !anchor.tagName) return [];
       return Array.from(document.querySelectorAll(anchor.tagName)).filter((element) => this.getTextSignature(element) === anchor.textSignature);
-    }
-
-    scoreElements(elements, anchor, baseScore) {
-      return [...new Set(elements.filter(Boolean))].map((element) => ({
-        element,
-        score: baseScore + this.scoreAnchorMatch(element, anchor),
-      }));
-    }
-
-    scoreAnchorMatch(element, anchor) {
-      let score = 0;
-      if (anchor.tagName && element.tagName.toLowerCase() === anchor.tagName) score += 8;
-      if (anchor.id && element.id === anchor.id) score += 12;
-      if (anchor.textSignature && this.getTextSignature(element) === anchor.textSignature) score += 10;
-      if (anchor.ariaLabel && element.getAttribute("aria-label") === anchor.ariaLabel) score += 8;
-      if (anchor.role && element.getAttribute("role") === anchor.role) score += 6;
-      const attrs = anchor.attributes || {};
-      for (const [name, value] of Object.entries(attrs)) {
-        if (value && element.getAttribute(name) === value) score += 4;
-      }
-      score += this.scoreSiblingContext(element, anchor.siblingContext);
-      score += this.scoreVisualFingerprint(element, anchor.visual);
-      return score;
     }
 
     scoreSiblingContext(element, context) {
@@ -800,11 +854,28 @@
     }
 
     normalizeAnnotation(annotation) {
-      if (annotation.anchor) return annotation;
-
       const legacyElement = annotation.element || {};
       const createdAt = typeof annotation.createdAt === "number" ? annotation.createdAt : Date.parse(annotation.createdAt) || Date.now();
       const updatedAt = typeof annotation.updatedAt === "number" ? annotation.updatedAt : Date.parse(annotation.updatedAt) || createdAt;
+      const sourceAnchor = annotation.anchor || null;
+      const anchor = sourceAnchor || {
+        type: "element",
+        tagName: legacyElement.tagName || "unknown",
+        id: legacyElement.id || null,
+        classList: legacyElement.classList || [],
+        dataAttributes: legacyElement.dataAttributes || {},
+        attributes: legacyElement.attributes || {},
+        cssSelector: legacyElement.cssSelector || "",
+        indexPath: legacyElement.indexPath || legacyElement.domPath || [],
+        siblingContext: legacyElement.siblingContext || null,
+        textSnippet: legacyElement.textSnippet || null,
+        textSignature: legacyElement.textSignature || null,
+        ariaLabel: legacyElement.ariaLabel || null,
+        role: legacyElement.role || null,
+        parentContext: legacyElement.parentContext || null,
+        bounds: legacyElement.bounds || { x: 0, y: 0, width: 0, height: 0, scrollX: 0, scrollY: 0 },
+        visual: legacyElement.visual || null,
+      };
 
       return {
         id: annotation.id || this.createId(),
@@ -815,26 +886,26 @@
         comment: annotation.comment || "",
         createdAt,
         updatedAt,
-        strategyVersion: STRATEGY_VERSION,
+        strategyVersion: annotation.strategyVersion || STRATEGY_VERSION,
         anchor: {
           type: "element",
-          tagName: legacyElement.tagName || "unknown",
-          id: legacyElement.id || null,
-          classList: legacyElement.classList || [],
-          dataAttributes: legacyElement.dataAttributes || {},
-          attributes: legacyElement.attributes || {},
-          cssSelector: legacyElement.cssSelector || "",
-          indexPath: legacyElement.indexPath || legacyElement.domPath || [],
-          siblingContext: legacyElement.siblingContext || null,
-          textSnippet: legacyElement.textSnippet || null,
-          textSignature: legacyElement.textSignature || null,
-          ariaLabel: legacyElement.ariaLabel || null,
-          role: legacyElement.role || null,
-          parentContext: legacyElement.parentContext || null,
-          bounds: legacyElement.bounds || { x: 0, y: 0, width: 0, height: 0, scrollX: 0, scrollY: 0 },
-          visual: legacyElement.visual || null,
+          tagName: anchor.tagName || "unknown",
+          id: anchor.id || null,
+          classList: anchor.classList || [],
+          dataAttributes: anchor.dataAttributes || {},
+          attributes: anchor.attributes || {},
+          cssSelector: anchor.cssSelector || "",
+          indexPath: anchor.indexPath || anchor.domPath || [],
+          siblingContext: anchor.siblingContext || null,
+          textSnippet: anchor.textSnippet || null,
+          textSignature: anchor.textSignature || null,
+          ariaLabel: anchor.ariaLabel || null,
+          role: anchor.role || null,
+          parentContext: anchor.parentContext || null,
+          bounds: anchor.bounds || { x: 0, y: 0, width: 0, height: 0, scrollX: 0, scrollY: 0 },
+          visual: anchor.visual || null,
         },
-        resolution: "unresolved",
+        resolution: annotation.resolution || "unresolved",
       };
     }
 
@@ -843,7 +914,7 @@
     }
 
     getPageKey() {
-      return `${location.pathname}${location.hash}`;
+      return this.options?.pageKey ? this.options.pageKey() : `${location.pathname}${location.hash}`;
     }
 
     createId() {
