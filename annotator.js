@@ -3,7 +3,7 @@
 
   const STORAGE_PREFIX = "ui-annotator:";
   const STYLE_ID = "ui-annotator-styles";
-  const STRATEGY_VERSION = 1;
+  const STRATEGY_VERSION = 2;
   const DATA_ATTRIBUTE_ALLOWLIST = [
     "data-annotator-id",
     "data-testid",
@@ -354,9 +354,12 @@
         id: element.id || null,
         classList: this.getStableClassList(element),
         dataAttributes: this.getDataAttributes(element),
+        attributes: this.getElementAttributes(element),
         cssSelector: this.getCssSelector(element),
         indexPath: this.getIndexPath(element),
+        siblingContext: this.getSiblingContext(element),
         textSnippet: this.getTextSnippet(element),
+        textSignature: this.getTextSignature(element),
         ariaLabel: element.getAttribute("aria-label"),
         role: element.getAttribute("role"),
         parentContext: parent,
@@ -368,39 +371,154 @@
           scrollX: Math.round(window.scrollX),
           scrollY: Math.round(window.scrollY),
         },
+        visual: this.getVisualFingerprint(element, rect),
       };
     }
 
     resolveElement(anchor) {
-      const attempts = [
-        () => this.resolveByDataAttributes(anchor),
-        () => anchor.cssSelector && document.querySelector(anchor.cssSelector),
-        () => this.resolveIndexPath(anchor.indexPath),
+      const candidates = [
+        ...this.scoreElements(this.resolveAllByDataAttributes(anchor), anchor, 100),
+        ...this.scoreElements(this.resolveAllBySelector(anchor.cssSelector), anchor, 80),
+        ...this.scoreElements(this.resolveAllBySiblingContext(anchor), anchor, 60),
+        ...this.scoreElements(this.resolveAllByTextSignature(anchor), anchor, 45),
+        ...this.scoreElements([this.resolveIndexPath(anchor.indexPath)], anchor, 25),
       ];
+      const best = candidates
+        .filter((candidate) => candidate.element instanceof Element && !candidate.element.closest(INTERNAL_SELECTOR))
+        .sort((a, b) => b.score - a.score)[0];
 
-      for (const attempt of attempts) {
-        try {
-          const element = attempt();
-          if (element instanceof Element && !element.closest(INTERNAL_SELECTOR)) return element;
-        } catch (_) {
-          // Ignore stale selectors; the next signal may still resolve.
-        }
-      }
-      return null;
+      return best?.element || null;
     }
 
-    resolveByDataAttributes(anchor) {
+    resolveAllByDataAttributes(anchor) {
       const entries = Object.entries(anchor.dataAttributes || {});
+      const matches = [];
       for (const [name, value] of entries) {
         const selector = `[${CSS.escape(name)}="${CSS.escape(value)}"]`;
-        const element = document.querySelector(selector);
-        if (element) return element;
+        matches.push(...document.querySelectorAll(selector));
       }
-      return null;
+      return matches;
+    }
+
+    resolveAllBySelector(selector) {
+      if (!selector) return [];
+      try {
+        return Array.from(document.querySelectorAll(selector));
+      } catch (_) {
+        return [];
+      }
+    }
+
+    resolveAllBySiblingContext(anchor) {
+      const context = anchor.siblingContext;
+      if (!context?.parentSelector) return [];
+      const parents = this.resolveAllBySelector(context.parentSelector);
+      return parents
+        .map((parent) => parent.children?.[context.indexInParent])
+        .filter(Boolean);
+    }
+
+    resolveAllByTextSignature(anchor) {
+      if (!anchor.textSignature || !anchor.tagName) return [];
+      return Array.from(document.querySelectorAll(anchor.tagName)).filter((element) => this.getTextSignature(element) === anchor.textSignature);
+    }
+
+    scoreElements(elements, anchor, baseScore) {
+      return [...new Set(elements.filter(Boolean))].map((element) => ({
+        element,
+        score: baseScore + this.scoreAnchorMatch(element, anchor),
+      }));
+    }
+
+    scoreAnchorMatch(element, anchor) {
+      let score = 0;
+      if (anchor.tagName && element.tagName.toLowerCase() === anchor.tagName) score += 8;
+      if (anchor.id && element.id === anchor.id) score += 12;
+      if (anchor.textSignature && this.getTextSignature(element) === anchor.textSignature) score += 10;
+      if (anchor.ariaLabel && element.getAttribute("aria-label") === anchor.ariaLabel) score += 8;
+      if (anchor.role && element.getAttribute("role") === anchor.role) score += 6;
+      const attrs = anchor.attributes || {};
+      for (const [name, value] of Object.entries(attrs)) {
+        if (value && element.getAttribute(name) === value) score += 4;
+      }
+      if (this.matchesVisualFingerprint(element, anchor.visual)) score += 6;
+      return score;
+    }
+
+    matchesVisualFingerprint(element, visual) {
+      if (!visual) return false;
+      const rect = element.getBoundingClientRect();
+      const widthClose = Math.abs(rect.width - visual.width) <= Math.max(8, visual.width * 0.2);
+      const heightClose = Math.abs(rect.height - visual.height) <= Math.max(8, visual.height * 0.2);
+      return widthClose && heightClose;
     }
 
     getCssSelector(element) {
+      const unique = this.getShortestUniqueSelector(element);
+      if (unique) return unique;
+      return this.getFullCssSelector(element);
+    }
+
+    getShortestUniqueSelector(element) {
+      const simpleSelectors = [];
+      for (const [name, value] of Object.entries(this.getDataAttributes(element))) {
+        simpleSelectors.push(`${element.tagName.toLowerCase()}[${CSS.escape(name)}="${CSS.escape(value)}"]`);
+        simpleSelectors.push(`[${CSS.escape(name)}="${CSS.escape(value)}"]`);
+      }
       if (element.id) return `#${CSS.escape(element.id)}`;
+      const stableClasses = this.getStableClassList(element).slice(0, 3);
+      if (stableClasses.length) {
+        simpleSelectors.push(`${element.tagName.toLowerCase()}${stableClasses.map((className) => `.${CSS.escape(className)}`).join("")}`);
+      }
+      simpleSelectors.push(element.tagName.toLowerCase());
+
+      for (const selector of simpleSelectors) {
+        if (this.isUniqueSelector(selector, element)) return selector;
+      }
+
+      const landmark = element.closest("main, header, footer, nav, aside, section, [role='main'], [role='navigation'], [id]");
+      if (landmark && landmark !== element) {
+        const parentSelector = landmark.id ? `#${CSS.escape(landmark.id)}` : this.getFullCssSelector(landmark);
+        const relativeSelector = this.getRelativeSelector(element, landmark);
+        const selector = `${parentSelector} ${relativeSelector}`;
+        if (this.isUniqueSelector(selector, element)) return selector;
+      }
+
+      return null;
+    }
+
+    getRelativeSelector(element, ancestor) {
+      const parts = [];
+      let current = element;
+      while (current && current !== ancestor) {
+        parts.unshift(this.getCompactSelectorPart(current));
+        current = current.parentElement;
+      }
+      return parts.join(" > ");
+    }
+
+    getCompactSelectorPart(element) {
+      let selector = element.tagName.toLowerCase();
+      const stableClasses = this.getStableClassList(element).slice(0, 2);
+      if (stableClasses.length) selector += stableClasses.map((className) => `.${CSS.escape(className)}`).join("");
+      const parent = element.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter((child) => child.tagName === element.tagName);
+        if (siblings.length > 1) selector += `:nth-of-type(${siblings.indexOf(element) + 1})`;
+      }
+      return selector;
+    }
+
+    isUniqueSelector(selector, element) {
+      try {
+        const matches = document.querySelectorAll(selector);
+        return matches.length === 1 && matches[0] === element;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    getFullCssSelector(element) {
       const parts = [];
       let current = element;
 
@@ -419,6 +537,30 @@
       }
 
       return parts.join(" > ");
+    }
+
+    getSiblingContext(element) {
+      const parent = element.parentElement;
+      if (!parent) return null;
+      const children = Array.from(parent.children);
+      const index = children.indexOf(element);
+      const previous = children[index - 1] || null;
+      const next = children[index + 1] || null;
+
+      return {
+        parentSelector: this.getCssSelector(parent),
+        indexInParent: index,
+        previousSibling: previous ? this.getSiblingSnapshot(previous) : null,
+        nextSibling: next ? this.getSiblingSnapshot(next) : null,
+      };
+    }
+
+    getSiblingSnapshot(element) {
+      return {
+        tagName: element.tagName.toLowerCase(),
+        textSnippet: this.getTextSnippet(element),
+        textSignature: this.getTextSignature(element),
+      };
     }
 
     getIndexPath(element) {
@@ -456,9 +598,39 @@
       }, {});
     }
 
+    getElementAttributes(element) {
+      const names = ["name", "type", "placeholder", "href", "src", "alt", "title", "value"];
+      return names.reduce((attributes, name) => {
+        const value = element.getAttribute(name);
+        if (value) attributes[name] = value;
+        return attributes;
+      }, {});
+    }
+
     getTextSnippet(element) {
       const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
-      return text ? text.slice(0, 80) : null;
+      return text ? text.slice(0, 160) : null;
+    }
+
+    getTextSignature(element) {
+      const text = (element.innerText || element.textContent || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!text) return null;
+      return text.split(" ").filter((word) => word.length > 1).slice(0, 6).join("-");
+    }
+
+    getVisualFingerprint(element, rect) {
+      const style = getComputedStyle(element);
+      return {
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        colorHint: style.backgroundColor || style.color || null,
+        borderRadius: parseFloat(style.borderRadius) || 0,
+        hasImage: Boolean(element.querySelector?.("img, svg") || ["img", "svg"].includes(element.tagName.toLowerCase())),
+      };
     }
 
     positionBox(box, rect) {
@@ -514,9 +686,12 @@
         `id: ${anchor.id || "-"}`,
         `classes: ${anchor.classList.join(" ") || "-"}`,
         `data: ${JSON.stringify(anchor.dataAttributes)}`,
+        `attrs: ${JSON.stringify(anchor.attributes || {})}`,
         `selector: ${anchor.cssSelector}`,
-        `indexPath: ${anchor.indexPath.join(".")}`,
+        `sibling: ${anchor.siblingContext?.parentSelector || "-"}`,
+        `indexPath: ${(anchor.indexPath || []).join(".")}`,
         `text: ${anchor.textSnippet || "-"}`,
+        `signature: ${anchor.textSignature || "-"}`,
         `parent: ${anchor.parentContext?.cssSelector || "-"}`,
       ].join("\n");
     }
@@ -581,13 +756,17 @@
           id: legacyElement.id || null,
           classList: legacyElement.classList || [],
           dataAttributes: legacyElement.dataAttributes || {},
+          attributes: legacyElement.attributes || {},
           cssSelector: legacyElement.cssSelector || "",
           indexPath: legacyElement.indexPath || legacyElement.domPath || [],
+          siblingContext: legacyElement.siblingContext || null,
           textSnippet: legacyElement.textSnippet || null,
+          textSignature: legacyElement.textSignature || null,
           ariaLabel: legacyElement.ariaLabel || null,
           role: legacyElement.role || null,
           parentContext: legacyElement.parentContext || null,
           bounds: legacyElement.bounds || { x: 0, y: 0, width: 0, height: 0, scrollX: 0, scrollY: 0 },
+          visual: legacyElement.visual || null,
         },
         resolution: "unresolved",
       };

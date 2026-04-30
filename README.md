@@ -40,14 +40,17 @@ Each annotation stores the comment and a multi-signal element reference:
 
 - page key and full URL
 - strategy version
-- CSS selector
-- DOM index path
+- shortest unique CSS selector
+- DOM index path as the last-resort fallback
+- sibling context
 - tag, id, and classes
 - allowlisted data attributes like `data-testid`, `data-cy`, and `data-annotator-id`
-- visible text snippet
+- stable element attributes like `type`, `name`, `href`, `src`, `alt`, `title`, and `placeholder`
+- visible text snippet and normalized text signature
 - ARIA label and role
 - parent context
 - element bounds and scroll position at annotation time
+- visual fingerprint for fuzzy fallback
 
 This keeps the implementation practical for arbitrary websites where IDs and classes may not be perfectly stable.
 
@@ -63,7 +66,7 @@ Example export shape:
   "comment": "Make this label clearer",
   "createdAt": 1777545123000,
   "updatedAt": 1777545123000,
-  "strategyVersion": 1,
+  "strategyVersion": 2,
   "anchor": {
     "type": "element",
     "tagName": "button",
@@ -72,9 +75,23 @@ Example export shape:
     "dataAttributes": {
       "data-testid": "create-report"
     },
-    "cssSelector": "main > section.hero > div.hero-copy > div.actions > button.primary",
+    "attributes": {
+      "type": "button"
+    },
+    "cssSelector": "button.primary[data-testid=\"create-report\"]",
     "indexPath": [1, 1, 0, 0, 2, 0],
+    "siblingContext": {
+      "parentSelector": "div.actions",
+      "indexInParent": 0,
+      "previousSibling": null,
+      "nextSibling": {
+        "tagName": "button",
+        "textSnippet": "Invite reviewer",
+        "textSignature": "invite-reviewer"
+      }
+    },
     "textSnippet": "Create report",
+    "textSignature": "create-report",
     "ariaLabel": null,
     "role": null,
     "parentContext": {
@@ -90,6 +107,13 @@ Example export shape:
       "height": 36,
       "scrollX": 0,
       "scrollY": 0
+    },
+    "visual": {
+      "width": 113,
+      "height": 36,
+      "colorHint": "rgb(15, 118, 110)",
+      "borderRadius": 6,
+      "hasImage": false
     }
   },
   "resolution": "resolved"
