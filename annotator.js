@@ -392,12 +392,9 @@
 
     resolveAllByDataAttributes(anchor) {
       const entries = Object.entries(anchor.dataAttributes || {});
-      const matches = [];
-      for (const [name, value] of entries) {
-        const selector = `[${CSS.escape(name)}="${CSS.escape(value)}"]`;
-        matches.push(...document.querySelectorAll(selector));
-      }
-      return matches;
+      if (!entries.length) return [];
+      const selector = entries.map(([name, value]) => `[${CSS.escape(name)}="${CSS.escape(value)}"]`).join("");
+      return this.resolveAllBySelector(selector);
     }
 
     resolveAllBySelector(selector) {
@@ -441,16 +438,57 @@
       for (const [name, value] of Object.entries(attrs)) {
         if (value && element.getAttribute(name) === value) score += 4;
       }
-      if (this.matchesVisualFingerprint(element, anchor.visual)) score += 6;
+      score += this.scoreSiblingContext(element, anchor.siblingContext);
+      score += this.scoreVisualFingerprint(element, anchor.visual);
       return score;
     }
 
-    matchesVisualFingerprint(element, visual) {
-      if (!visual) return false;
+    scoreSiblingContext(element, context) {
+      if (!context) return 0;
+      let score = 0;
+      const parentSelector = context.parentSelector;
+      if (parentSelector && element.parentElement && this.resolveAllBySelector(parentSelector).includes(element.parentElement)) score += 6;
+      if (Number.isInteger(context.indexInParent) && element.parentElement?.children?.[context.indexInParent] === element) score += 6;
+
+      const previous = element.previousElementSibling;
+      const next = element.nextElementSibling;
+      if (this.matchesSiblingSnapshot(previous, context.previousSibling)) score += 6;
+      if (this.matchesSiblingSnapshot(next, context.nextSibling)) score += 6;
+      return score;
+    }
+
+    matchesSiblingSnapshot(element, snapshot) {
+      if (!snapshot) return !element;
+      if (!element) return false;
+      if (snapshot.tagName && element.tagName.toLowerCase() !== snapshot.tagName) return false;
+      if (snapshot.textSignature && this.getTextSignature(element) !== snapshot.textSignature) return false;
+      return true;
+    }
+
+    scoreVisualFingerprint(element, visual) {
+      if (!visual) return 0;
       const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
       const widthClose = Math.abs(rect.width - visual.width) <= Math.max(8, visual.width * 0.2);
       const heightClose = Math.abs(rect.height - visual.height) <= Math.max(8, visual.height * 0.2);
-      return widthClose && heightClose;
+      if (!widthClose || !heightClose) return 0;
+
+      let score = 8;
+      const currentBackground = style.backgroundColor || null;
+      const currentColor = style.color || null;
+      const background = visual.backgroundColor || visual.colorHint || null;
+      if (this.colorsMatch(currentBackground, background)) score += 5;
+      if (this.colorsMatch(currentColor, visual.color)) score += 4;
+      if (Math.abs((parseFloat(style.borderRadius) || 0) - (visual.borderRadius || 0)) <= 2) score += 3;
+
+      const hasImage = this.elementHasImage(element);
+      if (visual.hasImage === hasImage) score += 5;
+      return score;
+    }
+
+    colorsMatch(current, stored) {
+      if (!current || !stored) return false;
+      return current.replace(/\s/g, "") === stored.replace(/\s/g, "");
     }
 
     getCssSelector(element) {
@@ -599,10 +637,32 @@
     }
 
     getElementAttributes(element) {
-      const names = ["name", "type", "placeholder", "href", "src", "alt", "title", "value"];
+      const names = [
+        "name",
+        "type",
+        "placeholder",
+        "href",
+        "src",
+        "alt",
+        "title",
+        "value",
+        "for",
+        "rel",
+        "target",
+        "download",
+        "checked",
+        "selected",
+        "disabled",
+        "readonly",
+        "required",
+        "pattern",
+        "min",
+        "max",
+        "step",
+      ];
       return names.reduce((attributes, name) => {
         const value = element.getAttribute(name);
-        if (value) attributes[name] = value;
+        if (value !== null && value !== "") attributes[name] = value;
         return attributes;
       }, {});
     }
@@ -615,7 +675,7 @@
     getTextSignature(element) {
       const text = (element.innerText || element.textContent || "")
         .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, " ")
+        .replace(/[^\p{L}\p{N}\s-]/gu, " ")
         .replace(/\s+/g, " ")
         .trim();
       if (!text) return null;
@@ -627,10 +687,16 @@
       return {
         width: Math.round(rect.width),
         height: Math.round(rect.height),
+        backgroundColor: style.backgroundColor || null,
+        color: style.color || null,
         colorHint: style.backgroundColor || style.color || null,
         borderRadius: parseFloat(style.borderRadius) || 0,
-        hasImage: Boolean(element.querySelector?.("img, svg") || ["img", "svg"].includes(element.tagName.toLowerCase())),
+        hasImage: this.elementHasImage(element),
       };
+    }
+
+    elementHasImage(element) {
+      return Boolean(element.querySelector?.("img, svg") || ["img", "svg"].includes(element.tagName.toLowerCase()));
     }
 
     positionBox(box, rect) {

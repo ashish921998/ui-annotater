@@ -50,7 +50,7 @@ Each annotation stores the comment and a multi-signal element reference:
 - ARIA label and role
 - parent context
 - element bounds and scroll position at annotation time
-- visual fingerprint for fuzzy fallback
+- visual fingerprint for fuzzy fallback, including size, color, background, radius, and image presence
 
 This keeps the implementation practical for arbitrary websites where IDs and classes may not be perfectly stable.
 
@@ -111,6 +111,8 @@ Example export shape:
     "visual": {
       "width": 113,
       "height": 36,
+      "backgroundColor": "rgb(15, 118, 110)",
+      "color": "rgb(255, 255, 255)",
       "colorHint": "rgb(15, 118, 110)",
       "borderRadius": 6,
       "hasImage": false
